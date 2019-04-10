@@ -17,6 +17,11 @@
 import {CSS} from '../../../build/amp-script-0.1.css';
 import {Layout, isLayoutSizeDefined} from '../../../src/layout';
 import {Services} from '../../../src/services';
+import {UserActivationTracker} from './user-activation-tracker';
+import {
+  sanitizer,
+  upgrade,
+} from '@ampproject/worker-dom/dist/unminified.index.safe.mjs.patched';
 // TODO(choumx): Avoid bundling an extra copy of DOMPurify here.
 import {addPurifyHooks, purifyConfig} from '../../../src/purifier';
 import {
@@ -25,10 +30,6 @@ import {
 import {dev, user} from '../../../src/log';
 import {getMode} from '../../../src/mode';
 import {isExperimentOn} from '../../../src/experiments';
-import {
-  sanitizer,
-  upgrade,
-} from '@ampproject/worker-dom/dist/unminified.index.safe.mjs.patched';
 
 /** @const {string} */
 const TAG = 'amp-script';
@@ -36,7 +37,32 @@ const TAG = 'amp-script';
 /** @const {number} */
 const MAX_SCRIPT_SIZE = 150000;
 
+/**
+ * Size-contained elements up to 300px are allowed to mutate freely.
+ */
+const MAX_FREE_MUTATION_HEIGHT = 300;
+
+const PHASE_HYDRATING = 1;
+const PHASE_MUTATING = 2;
+
 export class AmpScript extends AMP.BaseElement {
+
+  /**
+   * @param {!Element} element
+   */
+  constructor(element) {
+    super(element);
+
+    /** @private @const {!../../../src/service/vsync-impl.Vsync} */
+    this.vsync_ = Services.vsyncFor(this.win);
+
+    /** @private {?Worker} */
+    this.workerDom_ = null;
+
+    /** @private {?UserActivationTracker} */
+    this.userActivation_ = null;
+  }
+
   /** @override */
   isLayoutSupported(layout) {
     return layout == Layout.CONTAINER ||
@@ -49,6 +75,9 @@ export class AmpScript extends AMP.BaseElement {
       user().error(TAG, 'Experiment "amp-script" is not enabled.');
       return Promise.reject('Experiment "amp-script" is not enabled.');
     }
+
+    this.userActivation_ = new UserActivationTracker(this.element);
+
     // Configure worker-dom's sanitizer with AMP-specific config and hooks.
     const config = purifyConfig();
     sanitizer.configure(config, {
@@ -81,16 +110,20 @@ export class AmpScript extends AMP.BaseElement {
             + MAX_SCRIPT_SIZE);
         return [];
       }
-      return [workerScript, authorScript, authorUrl];
+      return [workerScript, authorScript];
     }),
-    // Configure callbacks.
+    // WorkerDOMConfiguration
     {
+      authorURL: authorUrl,
+      mutationPump: this.mutationPump_.bind(this),
+      longTask: promise => {
+        this.userActivation_.expandLongTask(promise);
+        // TODO(dvoytenko): consider additional "progress" UI.
+      },
+
+      // Callbacks.
       onCreateWorker: data => {
         dev().info(TAG, 'Create worker:', data);
-      },
-      onHydration: () => {
-        dev().info(TAG, 'Hydrated!');
-        this.element.classList.add('i-amphtml-hydrated');
       },
       onSendMessage: data => {
         dev().info(TAG, 'To worker:', data);
@@ -98,8 +131,9 @@ export class AmpScript extends AMP.BaseElement {
       onReceiveMessage: data => {
         dev().info(TAG, 'From worker:', data);
       },
-    },
-    /* debug */ true);
+    }).then(workerDom => {
+      this.workerDom_ = workerDom;
+    });
     return Promise.resolve();
   }
 
@@ -114,6 +148,39 @@ export class AmpScript extends AMP.BaseElement {
     const useLocal = getMode().localDev || getMode().test;
     return calculateExtensionScriptUrl(
         location, 'amp-script-worker', '0.1', useLocal);
+  }
+
+  /**
+   * @param {function()} flush
+   * @param {number} phase
+   * @private
+   */
+  mutationPump_(flush, phase) {
+    if (phase == PHASE_HYDRATING) {
+      this.vsync_.mutate(
+          () => this.element.classList.add('i-amphtml-hydrated'));
+    }
+    const allowMutation = (
+      // Hydration is always allowed.
+      phase != PHASE_MUTATING
+      // Mutation depends on the gesture state and long tasks.
+      || this.userActivation_.isActive()
+      // If the element is size-contained and small enough.
+      || (isLayoutSizeDefined(this.getLayout())
+          && this.getLayoutBox().height <= MAX_FREE_MUTATION_HEIGHT)
+    );
+
+    if (allowMutation) {
+      this.vsync_.mutate(flush);
+      return;
+    }
+
+    // Otherwise, terminate the worker.
+    this.workerDom_.terminate();
+    // TODO(dvoytenko): a better UI to indicate the broken state.
+    this.element.classList.remove('i-amphtml-hydrated');
+    this.element.classList.add('i-amphtml-broken');
+    user().error(TAG, '"amp-script" is terminated due to unallowed mutation.');
   }
 }
 
